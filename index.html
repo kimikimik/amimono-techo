@@ -8,15 +8,6 @@
   <meta name="theme-color" content="#f6f3ec" />
   <title>編みもの帖</title>
 
-  <!--
-    編みもの帖 — しおりコア 実機版 v1（IndexedDB / 単一HTML）
-    出発点：amimono-techo-shiori.jsx（写真・二層版・v19）
-    変更点はこの2つだけ：
-      ① ビルド不要の単一HTMLに畳んだ（React/Tailwind/Babel をCDNで読む）
-      ② 保存を window.storage → IndexedDB に差し替え（写真が溜まっても破綻しない容量へ）
-    UIコード（見た目・文言・誘い水・温度）は元のまま、一字一句変えていない。
-  -->
-
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -41,59 +32,6 @@
   <script type="text/babel" data-presets="react">
     const { useState, useEffect, useRef } = React;
 
-    // ───────────────────────────────────────────────
-    // 保存層：window.storage と同じ「get / set」の形をした IndexedDB の部品。
-    // これで本体コード（works の読み書き）は一切変えずに引っ越せる。
-    //   ・get(key) → { value } もしくは null
-    //   ・set(key, value)
-    // ───────────────────────────────────────────────
-    const idbStorage = {
-      _db: null,
-      _open() {
-        if (this._db) return this._db;
-        this._db = new Promise((resolve, reject) => {
-          const req = indexedDB.open("amimono-techo", 1);
-          req.onupgradeneeded = () => req.result.createObjectStore("kv");
-          req.onsuccess = () => resolve(req.result);
-          req.onerror = () => reject(req.error);
-        });
-        return this._db;
-      },
-      async get(key) {
-        const db = await this._open();
-        return new Promise((resolve, reject) => {
-          const tx = db.transaction("kv", "readonly");
-          const req = tx.objectStore("kv").get(key);
-          req.onsuccess = () => resolve(req.result != null ? { value: req.result } : null);
-          req.onerror = () => reject(req.error);
-        });
-      },
-      async set(key, value) {
-        const db = await this._open();
-        return new Promise((resolve, reject) => {
-          const tx = db.transaction("kv", "readwrite");
-          tx.objectStore("kv").put(value, key);
-          tx.oncomplete = () => resolve({ key, value });
-          tx.onerror = () => reject(tx.error);
-        });
-      },
-    };
-
-    // 本体コードはこの名前のまま window.storage を呼ぶ。中身だけ IndexedDB に。
-    window.storage = idbStorage;
-
-    // ───────────────────────────────────────────────
-    // ここから下は amimono-techo-shiori.jsx（写真・二層版）そのまま。
-    //   import 文を削り、export default を外し、末尾に render を足しただけ。
-    // ───────────────────────────────────────────────
-
-    // 編みもの帖 — しおり版 + 「満ちる（写真）」を試す版
-    //   ・写真は「あしあと」の一種（文字のメモと同じ列に並ぶ）
-    //   ・最初の一枚が自動で“顔（表紙）”に。あとからタップで変えられる
-    //   ・「写真をそえる」は静かな誘い水（押さない・いつでもそこにある）
-
-    const KEY = "amimono:techo:shiori:v1";
-
     const serif = { fontFamily: "'Georgia', 'Noto Serif JP', serif" };
     const paper = "#f6f3ec";
     const ink = "#4a443b";
@@ -109,66 +47,120 @@
       return `${d.getMonth() + 1}月${d.getDate()}日`;
     }
 
-    // その子の“顔”＝表紙の写真を取り出す（明示selectがあればそれ、なければ最初の一枚）
-    function coverSrc(w) {
-      const photos = (w.timeline || []).filter((e) => e.type === "photo");
-      if (photos.length === 0) return null;
-      if (w.coverId) {
-        const c = photos.find((p) => p.id === w.coverId);
-        if (c) return c.src;
-      }
-      return photos[0].src;
+    const COVER_PHOTO_TARGET_KB = 500;
+    const LOG_PHOTO_TARGET_KB = 200;
+
+    // 画像を読み込み、長辺を縮小しつつJPEG品質を段階的に下げて目標サイズ(KB)に近づける
+    function compressImage(file, targetKB) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(reader.error);
+        reader.onload = () => {
+          const img = new Image();
+          img.onerror = () => reject(new Error("画像を読み込めませんでした"));
+          img.onload = () => {
+            const maxDim = 1600;
+            let { width, height } = img;
+            if (width > maxDim || height > maxDim) {
+              const scale = maxDim / Math.max(width, height);
+              width = Math.round(width * scale);
+              height = Math.round(height * scale);
+            }
+            const canvas = document.createElement("canvas");
+            canvas.width = width;
+            canvas.height = height;
+            canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+
+            const attempt = (quality, triesLeft) => {
+              canvas.toBlob(
+                (blob) => {
+                  if (!blob) {
+                    reject(new Error("圧縮に失敗しました"));
+                    return;
+                  }
+                  const sizeKB = blob.size / 1024;
+                  if (sizeKB <= targetKB || quality <= 0.3 || triesLeft <= 0) {
+                    resolve(blob);
+                  } else {
+                    attempt(quality - 0.12, triesLeft - 1);
+                  }
+                },
+                "image/jpeg",
+                quality
+              );
+            };
+            attempt(0.85, 6);
+          };
+          img.src = reader.result;
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // 圧縮済みBlobをSupabase Storageの work-photos バケットにアップロードし、公開URLを返す
+    async function uploadWorkPhoto(blob, workId) {
+      const path = `${workId}/${Date.now()}.jpg`;
+      const { error } = await window.supabaseClient.storage
+        .from("work-photos")
+        .upload(path, blob, { contentType: "image/jpeg" });
+      if (error) throw error;
+      const { data } = window.supabaseClient.storage.from("work-photos").getPublicUrl(path);
+      return data.publicUrl;
     }
 
     function App() {
       const [works, setWorks] = useState([]);
       const [loaded, setLoaded] = useState(false);
-      const [saved, setSaved] = useState(false);
       const [openId, setOpenId] = useState(null);
       const [page, setPage] = useState('home');
+      const [error, setError] = useState(null);
 
-      useEffect(() => {
-        (async () => {
-          try {
-            const r = await window.storage.get(KEY);
-            if (r && r.value) setWorks(JSON.parse(r.value));
-          } catch (e) {}
+      useEffect(() => { loadWorks(); }, []);
+
+      async function loadWorks() {
+        setError(null);
+        const { data, error } = await window.supabaseClient
+          .from('works')
+          .select('*')
+          .eq('user_id', CURRENT_USER_ID)
+          .order('created_at', { ascending: false });
+        if (error) {
+          setError(error.message);
           setLoaded(true);
-        })();
-      }, []);
-
-      useEffect(() => {
-        if (!loaded) return;
-        (async () => {
-          try {
-            await window.storage.set(KEY, JSON.stringify(works));
-            setSaved(true);
-            const t = setTimeout(() => setSaved(false), 1400);
-            return () => clearTimeout(t);
-          } catch (e) {}
-        })();
-      }, [works, loaded]);
+          return;
+        }
+        const coverLogIds = (data || []).map((w) => w.cover_log_id).filter((id) => id != null);
+        let coverMap = {};
+        if (coverLogIds.length > 0) {
+          const { data: coverLogs } = await window.supabaseClient
+            .from('work_logs')
+            .select('id, photo_url')
+            .in('id', coverLogIds);
+          (coverLogs || []).forEach((l) => { coverMap[l.id] = l.photo_url; });
+        }
+        setWorks((data || []).map((w) => ({ ...w, coverUrl: w.cover_log_id ? coverMap[w.cover_log_id] || null : null })));
+        setLoaded(true);
+      }
 
       const open = works.find((w) => w.id === openId) || null;
 
-      function startCounting() {
-        const id = "w" + Date.now();
-        const w = {
-          id,
-          createdAt: Date.now(),
-          currentRow: 0,
-          name: "",
-          timeline: [],
-          completed: false,
-          unravelOpenId: null,
-          coverId: null,
-        };
-        setWorks((prev) => [w, ...prev]);
-        setOpenId(id);
+      async function startCounting() {
+        setError(null);
+        const { data, error } = await window.supabaseClient
+          .from('works')
+          .insert([{ user_id: CURRENT_USER_ID, title: '', status: 'in_progress', current_row: 0 }])
+          .select()
+          .single();
+        if (error) {
+          setError(error.message);
+          return;
+        }
+        setWorks((prev) => [{ ...data, coverUrl: null }, ...prev]);
+        setOpenId(data.id);
       }
 
-      function updateWork(id, fn) {
-        setWorks((prev) => prev.map((w) => (w.id === id ? fn({ ...w }) : w)));
+      function patchWork(id, patch) {
+        setWorks((prev) => prev.map((w) => (w.id === id ? { ...w, ...patch } : w)));
       }
 
       if (!loaded) {
@@ -182,26 +174,22 @@
       return (
         <div style={{ ...serif, background: paper, color: ink }} className="min-h-screen">
           {open ? (
-            <WorkView work={open} onBack={() => setOpenId(null)} updateWork={updateWork} />
+            <WorkView work={open} onBack={() => setOpenId(null)} onChange={patchWork} />
           ) : page === 'yarns' ? (
             <YarnsPage onBack={() => setPage('home')} />
           ) : (
             <Home works={works} onStart={startCounting} onOpen={setOpenId} onYarns={() => setPage('yarns')} />
           )}
-          <div
-            className={`fixed bottom-3 left-1/2 -translate-x-1/2 text-xs text-stone-400 transition-opacity duration-500 ${
-              saved ? "opacity-100" : "opacity-0"
-            }`}
-          >
-            保存しました
-          </div>
+          {error && (
+            <div className="fixed bottom-3 left-1/2 -translate-x-1/2 text-xs text-red-400">{error}</div>
+          )}
         </div>
       );
     }
 
     function Home({ works, onStart, onOpen, onYarns }) {
-      const wip = works.filter((w) => !w.completed);
-      const done = works.filter((w) => w.completed);
+      const wip = works.filter((w) => w.status !== 'completed');
+      const done = works.filter((w) => w.status === 'completed');
 
       return (
         <div className="max-w-md mx-auto px-6 pt-12 pb-24">
@@ -230,7 +218,7 @@
                   <p className="text-sm text-stone-500 mb-4">いま編んでいるもの</p>
                   <ul className="space-y-3">
                     {wip.map((w) => {
-                      const cover = coverSrc(w);
+                      const cover = w.coverUrl;
                       return (
                         <li key={w.id}>
                           <button
@@ -249,13 +237,13 @@
                             </div>
                             <div className="min-w-0">
                               <div className="text-stone-700 truncate">
-                                {w.name ? w.name : `${w.currentRow}段目まで編みました`}
-                                {!w.name && (
+                                {w.title ? w.title : `${w.current_row}段目まで編みました`}
+                                {!w.title && (
                                   <span className="text-xs text-stone-400 ml-2">→ 名前をつける</span>
                                 )}
                               </div>
                               <div className="text-xs text-stone-400 mt-0.5">
-                                {fmtDay(w.createdAt)}にはじめた · 編んでいる途中
+                                {fmtDay(new Date(w.created_at).getTime())}にはじめた · 編んでいる途中
                               </div>
                             </div>
                           </button>
@@ -272,7 +260,7 @@
                   <p className="text-sm text-stone-500 mb-4 mt-10">編みあがったもの</p>
                   <div className="grid grid-cols-2 gap-3">
                     {done.map((w) => {
-                      const cover = coverSrc(w);
+                      const cover = w.coverUrl;
                       return (
                         <button
                           key={w.id}
@@ -287,7 +275,7 @@
                               style={{ background: "#efeae0" }}
                             >
                               <span className="text-stone-500 text-xs leading-relaxed">
-                                {w.name ? w.name : `${w.currentRow}段`}
+                                {w.title ? w.title : `${w.current_row}段`}
                               </span>
                               <span className="text-[10px] text-stone-400 underline mt-2">
                                 写真をそえる
@@ -320,13 +308,43 @@
       );
     }
 
-    function WorkView({ work, onBack, updateWork }) {
+    const ROW_SAVE_DEBOUNCE_MS = 3000;
+
+    function WorkView({ work, onBack, onChange }) {
+      const [logs, setLogs] = useState([]);
+      const [logsLoaded, setLogsLoaded] = useState(false);
+      const [currentRow, setCurrentRow] = useState(work.current_row);
+      const [status, setStatus] = useState(work.status);
+      const [title, setTitle] = useState(work.title || "");
+      const [coverLogId, setCoverLogId] = useState(work.cover_log_id);
+      const [pendingUnravel, setPendingUnravel] = useState(null);
       const [note, setNote] = useState("");
       const [naming, setNaming] = useState(false);
-      const [nameDraft, setNameDraft] = useState(work.name || "");
+      const [nameDraft, setNameDraft] = useState(work.title || "");
       const [bellOpen, setBellOpen] = useState(false);
       const [swing, setSwing] = useState(false);
+      const [error, setError] = useState(null);
       const fileRef = useRef(null);
+      const debounceTimerRef = useRef(null);
+      const currentRowRef = useRef(currentRow);
+      const lastSavedRowRef = useRef(work.current_row);
+      const pendingUnravelRef = useRef(null);
+
+      useEffect(() => { currentRowRef.current = currentRow; }, [currentRow]);
+      useEffect(() => { pendingUnravelRef.current = pendingUnravel; }, [pendingUnravel]);
+
+      useEffect(() => {
+        (async () => {
+          const { data, error } = await window.supabaseClient
+            .from("work_logs")
+            .select("*")
+            .eq("work_id", work.id)
+            .order("created_at", { ascending: true });
+          if (error) setError(error.message);
+          else setLogs(data || []);
+          setLogsLoaded(true);
+        })();
+      }, [work.id]);
 
       useEffect(() => {
         const t = setTimeout(() => {
@@ -336,101 +354,191 @@
         return () => clearTimeout(t);
       }, []);
 
+      useEffect(() => {
+        return () => {
+          if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+        };
+      }, []);
+
+      function scheduleFlush() {
+        if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = setTimeout(() => {
+          debounceTimerRef.current = null;
+          flush();
+        }, ROW_SAVE_DEBOUNCE_MS);
+      }
+
+      // 段数の保存と、編集中の「ほどいた」記録の保存をまとめて行う（デバウンスされた書き込み）
+      async function flush() {
+        const rowToSave = currentRowRef.current;
+        const unravel = pendingUnravelRef.current;
+        try {
+          if (rowToSave !== lastSavedRowRef.current) {
+            const { error } = await window.supabaseClient
+              .from("works")
+              .update({ current_row: rowToSave })
+              .eq("id", work.id);
+            if (error) throw error;
+            lastSavedRowRef.current = rowToSave;
+            onChange(work.id, { current_row: rowToSave });
+          }
+          if (unravel) {
+            if (unravel.dbId == null) {
+              const { data, error } = await window.supabaseClient
+                .from("work_logs")
+                .insert([{ work_id: work.id, type: "unravel", content: unravel.text }])
+                .select()
+                .single();
+              if (error) throw error;
+              setPendingUnravel((p) => (p && p.dbId == null ? { ...p, dbId: data.id } : p));
+            } else {
+              const { error } = await window.supabaseClient
+                .from("work_logs")
+                .update({ content: unravel.text, created_at: new Date().toISOString() })
+                .eq("id", unravel.dbId);
+              if (error) throw error;
+            }
+          }
+        } catch (e) {
+          setError(e.message);
+        }
+      }
+
+      // 「ほどいた」の編集中セッションを確定させる：今すぐ保存し、あしあとの一覧に確定として加える
+      async function commitPendingNow() {
+        if (debounceTimerRef.current) {
+          clearTimeout(debounceTimerRef.current);
+          debounceTimerRef.current = null;
+        }
+        await flush();
+        const finalized = pendingUnravelRef.current;
+        if (finalized && finalized.dbId != null) {
+          setLogs((prev) => [
+            ...prev,
+            {
+              id: finalized.dbId,
+              work_id: work.id,
+              type: "unravel",
+              content: finalized.text,
+              created_at: new Date(finalized.at).toISOString(),
+            },
+          ]);
+        }
+        setPendingUnravel(null);
+      }
+
       function plus() {
-        updateWork(work.id, (w) => {
-          w.currentRow = w.currentRow + 1;
-          w.unravelOpenId = null;
-          return w;
-        });
+        if (pendingUnravelRef.current) commitPendingNow();
+        setCurrentRow((c) => c + 1);
+        scheduleFlush();
       }
 
       function minus() {
-        updateWork(work.id, (w) => {
-          if (w.currentRow <= 0) return w;
-          const next = w.currentRow - 1;
-          w.currentRow = next;
+        setCurrentRow((c) => {
+          if (c <= 0) return c;
+          const next = c - 1;
           const label = next === 0 ? "ぜんぶほどいた" : `${next}段までほどいた`;
-          if (w.unravelOpenId) {
-            w.timeline = w.timeline.map((e) =>
-              e.id === w.unravelOpenId ? { ...e, text: label, at: Date.now() } : e
-            );
-          } else {
-            const id = "e" + Date.now();
-            w.timeline = [...w.timeline, { id, at: Date.now(), type: "unravel", text: label }];
-            w.unravelOpenId = id;
-          }
-          return w;
+          setPendingUnravel((prev) => ({ dbId: prev ? prev.dbId : null, text: label, at: Date.now() }));
+          return next;
         });
+        scheduleFlush();
       }
 
-      function saveNote() {
+      async function saveNote() {
         const text = note.trim();
         if (!text) return;
-        updateWork(work.id, (w) => {
-          w.timeline = [
-            ...w.timeline,
-            { id: "e" + Date.now(), at: Date.now(), type: "note", text },
-          ];
-          w.unravelOpenId = null;
-          return w;
-        });
+        await commitPendingNow();
+        setError(null);
+        const { data, error } = await window.supabaseClient
+          .from("work_logs")
+          .insert([{ work_id: work.id, type: "note", content: text }])
+          .select()
+          .single();
+        if (error) {
+          setError(error.message);
+          return;
+        }
+        setLogs((prev) => [...prev, data]);
         setNote("");
       }
 
-      // 写真をそえる：縮小してから、あしあとの一種として置く。最初の一枚は自動で表紙に。
-      function addPhoto(file) {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const img = new Image();
-          img.onload = () => {
-            const max = 800;
-            let width = img.width;
-            let height = img.height;
-            if (width > height && width > max) {
-              height = Math.round((height * max) / width);
-              width = max;
-            } else if (height >= width && height > max) {
-              width = Math.round((width * max) / height);
-              height = max;
-            }
-            const canvas = document.createElement("canvas");
-            canvas.width = width;
-            canvas.height = height;
-            canvas.getContext("2d").drawImage(img, 0, 0, width, height);
-            const src = canvas.toDataURL("image/jpeg", 0.7);
-            const id = "e" + Date.now();
-            updateWork(work.id, (w) => {
-              w.timeline = [...w.timeline, { id, at: Date.now(), type: "photo", src }];
-              w.unravelOpenId = null;
-              if (!w.coverId) w.coverId = id; // 最初の一枚が、そっと顔になる
-              return w;
-            });
-          };
-          img.src = reader.result;
-        };
-        reader.readAsDataURL(file);
+      // 写真をそえる：圧縮してStorageにアップロードし、あしあとの一種として置く。最初の一枚は自動で表紙に。
+      async function addPhoto(file) {
+        await commitPendingNow();
+        setError(null);
+        const isFirstPhoto = !logs.some((l) => l.type === "photo");
+        try {
+          const blob = await compressImage(file, isFirstPhoto ? COVER_PHOTO_TARGET_KB : LOG_PHOTO_TARGET_KB);
+          const url = await uploadWorkPhoto(blob, work.id);
+          const { data, error } = await window.supabaseClient
+            .from("work_logs")
+            .insert([{ work_id: work.id, type: "photo", photo_url: url }])
+            .select()
+            .single();
+          if (error) throw error;
+          setLogs((prev) => [...prev, data]);
+          if (isFirstPhoto) {
+            const { error: coverError } = await window.supabaseClient
+              .from("works")
+              .update({ cover_log_id: data.id })
+              .eq("id", work.id);
+            if (coverError) throw coverError;
+            setCoverLogId(data.id);
+            onChange(work.id, { cover_log_id: data.id, coverUrl: url });
+          }
+        } catch (e) {
+          setError(e.message);
+        }
       }
 
-      function setCover(id) {
-        updateWork(work.id, (w) => {
-          w.coverId = id;
-          return w;
-        });
+      async function setCover(logId, photoUrl) {
+        setError(null);
+        const { error } = await window.supabaseClient
+          .from("works")
+          .update({ cover_log_id: logId })
+          .eq("id", work.id);
+        if (error) {
+          setError(error.message);
+          return;
+        }
+        setCoverLogId(logId);
+        onChange(work.id, { cover_log_id: logId, coverUrl: photoUrl });
       }
 
-      function saveName() {
-        updateWork(work.id, (w) => {
-          w.name = nameDraft.trim();
-          return w;
-        });
+      async function saveName() {
+        const trimmed = nameDraft.trim();
         setNaming(false);
+        setTitle(trimmed);
+        setError(null);
+        const { error } = await window.supabaseClient
+          .from("works")
+          .update({ title: trimmed })
+          .eq("id", work.id);
+        if (error) {
+          setError(error.message);
+          return;
+        }
+        onChange(work.id, { title: trimmed });
       }
 
-      function toggleComplete() {
-        updateWork(work.id, (w) => {
-          w.completed = !w.completed;
-          return w;
-        });
+      async function toggleComplete() {
+        const next = status === "completed" ? "in_progress" : "completed";
+        setStatus(next);
+        setError(null);
+        const { error } = await window.supabaseClient
+          .from("works")
+          .update({ status: next })
+          .eq("id", work.id);
+        if (error) {
+          setError(error.message);
+          return;
+        }
+        onChange(work.id, { status: next });
+      }
+
+      async function handleBack() {
+        await commitPendingNow();
+        onBack();
       }
 
       function ringBell() {
@@ -439,10 +547,24 @@
         setBellOpen(true);
       }
 
-      const cover = coverSrc(work);
-      const photos = (work.timeline || []).filter((e) => e.type === "photo");
-      const defaultCoverId = photos[0]?.id;
-      const isCover = (id) => (work.coverId ? work.coverId === id : id === defaultCoverId);
+      const timelineItems = [
+        ...logs.map((l) => ({
+          id: l.id,
+          at: new Date(l.created_at).getTime(),
+          type: l.type,
+          text: l.content,
+          src: l.photo_url,
+        })),
+        ...(pendingUnravel
+          ? [{ id: "pending-unravel", at: pendingUnravel.at, type: "unravel", text: pendingUnravel.text }]
+          : []),
+      ];
+      const photoItems = timelineItems.filter((e) => e.type === "photo");
+      const defaultCoverId = photoItems[0]?.id;
+      const cover = coverLogId
+        ? photoItems.find((p) => p.id === coverLogId)?.src || null
+        : photoItems[0]?.src || null;
+      const isCover = (id) => (coverLogId ? coverLogId === id : id === defaultCoverId);
 
       return (
         <div className="max-w-md mx-auto px-6 pt-6 pb-32 relative">
@@ -458,7 +580,7 @@
             .swing { animation: bell-swing 0.7s ease-in-out; transform-origin: top center; }
           `}</style>
 
-          <button onClick={onBack} className="text-sm text-stone-400 mb-6">
+          <button onClick={handleBack} className="text-sm text-stone-400 mb-6">
             ← もどる
           </button>
 
@@ -475,9 +597,9 @@
 
           {/* 名前 */}
           <div className="text-center mb-1">
-            {work.name && !naming ? (
+            {title && !naming ? (
               <button onClick={() => setNaming(true)} className="text-stone-600 text-base">
-                {work.name}
+                {title}
               </button>
             ) : naming ? (
               <div className="flex items-center justify-center gap-2">
@@ -509,7 +631,7 @@
               </button>
               <div className="text-center">
                 <div className="text-5xl text-stone-700 tabular-nums leading-none">
-                  {work.currentRow}
+                  {currentRow}
                 </div>
                 <div className="text-xs text-stone-400 mt-2">段、編み終わった</div>
               </div>
@@ -526,7 +648,9 @@
           {/* あしあと（履歴）— 文字も写真も、同じ列に */}
           <div className="mt-10">
             <p className="text-xs text-stone-400 mb-3">あしあと</p>
-            {work.timeline.length === 0 ? (
+            {!logsLoaded ? (
+              <p className="text-xs text-stone-300">よみこんでいます…</p>
+            ) : timelineItems.length === 0 ? (
               <p className="text-xs text-stone-300 leading-relaxed">
                 まだ、なにもありません。
                 <br />
@@ -534,7 +658,7 @@
               </p>
             ) : (
               <ul className="space-y-3">
-                {work.timeline.map((e) => (
+                {timelineItems.map((e) => (
                   <li key={e.id} className="flex gap-3 items-baseline">
                     <span className="text-[10px] text-stone-300 w-24 flex-shrink-0">{fmt(e.at)}</span>
                     {e.type === "photo" ? (
@@ -549,7 +673,7 @@
                             <span className="text-[10px] text-amber-700/80">表紙</span>
                           ) : (
                             <button
-                              onClick={() => setCover(e.id)}
+                              onClick={() => setCover(e.id, e.src)}
                               className="text-[10px] text-stone-400 underline"
                             >
                               表紙にする
@@ -604,9 +728,11 @@
             </div>
           </div>
 
+          {error && <p className="text-xs text-red-400 text-center mt-4">{error}</p>}
+
           {/* 完成（そっと） */}
           <div className="mt-12 text-center">
-            {work.completed ? (
+            {status === "completed" ? (
               <div>
                 <p className="text-sm text-amber-700">完成 ✓</p>
                 <button onClick={toggleComplete} className="text-xs text-stone-400 underline mt-2">
