@@ -665,24 +665,35 @@
       );
     }
 
+    const CURRENT_USER_ID = 1; // 暫定固定値。ログイン機能が入ったら差し替える。
+
     function YarnsPage({ onBack }) {
       const [yarns, setYarns] = useState([]);
+      const [stocks, setStocks] = useState([]);
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState(null);
-      const [form, setForm] = useState({ name: '', brand: '', color: '', weight: '', memo: '' });
+      const [form, setForm] = useState({ name: '', brand: '', color: '', memo: '' });
       const [saving, setSaving] = useState(false);
       const [saved, setSaved] = useState(false);
+      const [stockForms, setStockForms] = useState({});
+      const [stockSavingId, setStockSavingId] = useState(null);
 
       useEffect(() => { loadYarns(); }, []);
 
       async function loadYarns() {
         setLoading(true);
         setError(null);
-        const { data, error } = await window.supabaseClient.from('yarns').select('*');
-        if (error) {
-          setError(error.message);
+        const [{ data: yarnsData, error: yarnsError }, { data: stocksData, error: stocksError }] = await Promise.all([
+          window.supabaseClient.from('yarns').select('*'),
+          window.supabaseClient.from('yarn_stocks').select('*').eq('user_id', CURRENT_USER_ID),
+        ]);
+        if (yarnsError) {
+          setError(yarnsError.message);
+        } else if (stocksError) {
+          setError(stocksError.message);
         } else {
-          setYarns(data || []);
+          setYarns(yarnsData || []);
+          setStocks(stocksData || []);
         }
         setLoading(false);
       }
@@ -696,16 +707,43 @@
           name: form.name.trim(),
           brand: form.brand.trim() || null,
           color: form.color.trim() || null,
-          weight: form.weight ? Number(form.weight) : null,
           memo: form.memo.trim() || null,
         }]);
         setSaving(false);
         if (error) {
           setError(error.message);
         } else {
-          setForm({ name: '', brand: '', color: '', weight: '', memo: '' });
+          setForm({ name: '', brand: '', color: '', memo: '' });
           setSaved(true);
           setTimeout(() => setSaved(false), 1400);
+          loadYarns();
+        }
+      }
+
+      function getStockForm(yarnId) {
+        return stockForms[yarnId] || { quantity: '', lot_number: '' };
+      }
+
+      function setStockForm(yarnId, next) {
+        setStockForms({ ...stockForms, [yarnId]: { ...getStockForm(yarnId), ...next } });
+      }
+
+      async function handleAddStock(yarnId) {
+        const stockForm = getStockForm(yarnId);
+        if (!stockForm.quantity) return;
+        setStockSavingId(yarnId);
+        setError(null);
+        const { error } = await window.supabaseClient.from('yarn_stocks').insert([{
+          user_id: CURRENT_USER_ID,
+          yarn_id: yarnId,
+          quantity: Number(stockForm.quantity),
+          lot_number: stockForm.lot_number.trim() || null,
+        }]);
+        setStockSavingId(null);
+        if (error) {
+          setError(error.message);
+        } else {
+          setStockForm(yarnId, { quantity: '', lot_number: '' });
           loadYarns();
         }
       }
@@ -737,14 +775,6 @@
               placeholder="色"
               className="w-full bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 text-sm text-stone-700 outline-none placeholder:text-stone-300"
             />
-            <input
-              value={form.weight}
-              onChange={e => setForm({ ...form, weight: e.target.value })}
-              type="number"
-              min="0"
-              placeholder="重さ（g）"
-              className="w-full bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 text-sm text-stone-700 outline-none placeholder:text-stone-300"
-            />
             <textarea
               value={form.memo}
               onChange={e => setForm({ ...form, memo: e.target.value })}
@@ -770,17 +800,60 @@
             <p className="text-xs text-stone-300 leading-relaxed">まだ登録された毛糸はありません。</p>
           ) : (
             <ul className="space-y-3">
-              {yarns.map(yarn => (
-                <li key={yarn.id} className="bg-white border border-stone-200 rounded-xl px-4 py-4">
-                  <div className="text-stone-700 text-sm">{yarn.name}</div>
-                  <div className="flex flex-wrap gap-x-2 mt-0.5">
-                    {yarn.brand && <span className="text-xs text-stone-400">{yarn.brand}</span>}
-                    {yarn.color && <span className="text-xs text-stone-400">· {yarn.color}</span>}
-                    {yarn.weight && <span className="text-xs text-stone-400">· {yarn.weight}g</span>}
-                  </div>
-                  {yarn.memo && <p className="text-xs text-stone-500 mt-1">{yarn.memo}</p>}
-                </li>
-              ))}
+              {yarns.map(yarn => {
+                const yarnStocks = stocks.filter(s => s.yarn_id === yarn.id);
+                const totalQuantity = yarnStocks.reduce((sum, s) => sum + (s.quantity || 0), 0);
+                const stockForm = getStockForm(yarn.id);
+                return (
+                  <li key={yarn.id} className="bg-white border border-stone-200 rounded-xl px-4 py-4">
+                    <div className="text-stone-700 text-sm">{yarn.name}</div>
+                    <div className="flex flex-wrap gap-x-2 mt-0.5">
+                      {yarn.brand && <span className="text-xs text-stone-400">{yarn.brand}</span>}
+                      {yarn.color && <span className="text-xs text-stone-400">· {yarn.color}</span>}
+                    </div>
+                    {yarn.memo && <p className="text-xs text-stone-500 mt-1">{yarn.memo}</p>}
+
+                    <div className="mt-3 pt-3 border-t border-stone-100">
+                      <p className="text-xs text-stone-400 mb-1.5">
+                        在庫 {totalQuantity > 0 ? `· ${totalQuantity}玉` : ''}
+                      </p>
+                      {yarnStocks.length > 0 && (
+                        <ul className="space-y-1 mb-2">
+                          {yarnStocks.map(s => (
+                            <li key={s.id} className="text-xs text-stone-500 flex justify-between">
+                              <span>{s.lot_number ? `ロット ${s.lot_number}` : 'ロット未記入'}</span>
+                              <span>{s.quantity}玉</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      <div className="flex gap-1.5">
+                        <input
+                          value={stockForm.quantity}
+                          onChange={e => setStockForm(yarn.id, { quantity: e.target.value })}
+                          type="number"
+                          min="0"
+                          placeholder="数量"
+                          className="w-20 bg-stone-50 border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-700 outline-none placeholder:text-stone-300"
+                        />
+                        <input
+                          value={stockForm.lot_number}
+                          onChange={e => setStockForm(yarn.id, { lot_number: e.target.value })}
+                          placeholder="ロット番号"
+                          className="flex-1 bg-stone-50 border border-stone-200 rounded-lg px-2 py-1.5 text-xs text-stone-700 outline-none placeholder:text-stone-300"
+                        />
+                        <button
+                          onClick={() => handleAddStock(yarn.id)}
+                          disabled={stockSavingId === yarn.id || !stockForm.quantity}
+                          className="text-xs text-stone-500 border border-stone-200 rounded-lg px-3 py-1.5 bg-white active:scale-95 transition-transform disabled:opacity-40"
+                        >
+                          追加
+                        </button>
+                      </div>
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
           )}
 
