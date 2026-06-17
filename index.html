@@ -36,6 +36,8 @@
     const paper = "#f6f3ec";
     const ink = "#4a443b";
 
+    const CURRENT_USER_ID = 1; // 暫定固定値。ログイン機能が入ったら差し替える。
+
     function fmt(ts) {
       const d = new Date(ts);
       return `${d.getMonth() + 1}月${d.getDate()}日 ${String(d.getHours()).padStart(2, "0")}:${String(
@@ -108,10 +110,17 @@
       return data.publicUrl;
     }
 
+    // -----------------------------------------------------------------------
+    // App — ルーティング管理
+    // openYarnId が設定されると YarnDetailPage を最前面に表示。
+    // 戻るときは openYarnId を null に戻すだけで、残りの状態（openId / page）が
+    // 自動的に直前の画面を復元する。
+    // -----------------------------------------------------------------------
     function App() {
       const [works, setWorks] = useState([]);
       const [loaded, setLoaded] = useState(false);
       const [openId, setOpenId] = useState(null);
+      const [openYarnId, setOpenYarnId] = useState(null);
       const [page, setPage] = useState('home');
       const [error, setError] = useState(null);
 
@@ -173,10 +182,24 @@
 
       return (
         <div style={{ ...serif, background: paper, color: ink }} className="min-h-screen">
-          {open ? (
-            <WorkView work={open} onBack={() => setOpenId(null)} onChange={patchWork} />
+          {openYarnId ? (
+            <YarnDetailPage
+              yarnId={openYarnId}
+              onBack={() => setOpenYarnId(null)}
+              onOpenWork={(workId) => { setOpenYarnId(null); setOpenId(workId); }}
+            />
+          ) : open ? (
+            <WorkView
+              work={open}
+              onBack={() => setOpenId(null)}
+              onChange={patchWork}
+              onOpenYarn={(yarnId) => setOpenYarnId(yarnId)}
+            />
           ) : page === 'yarns' ? (
-            <YarnsPage onBack={() => setPage('home')} />
+            <YarnsPage
+              onBack={() => setPage('home')}
+              onYarnDetail={(yarnId) => setOpenYarnId(yarnId)}
+            />
           ) : (
             <Home works={works} onStart={startCounting} onOpen={setOpenId} onYarns={() => setPage('yarns')} />
           )}
@@ -212,7 +235,6 @@
             </div>
           ) : (
             <>
-              {/* いま編んでいるもの＝作業机：小さな写真＋テキスト */}
               {wip.length > 0 && (
                 <>
                   <p className="text-sm text-stone-500 mb-4">いま編んでいるもの</p>
@@ -254,7 +276,6 @@
                 </>
               )}
 
-              {/* 編みあがったもの＝眺める棚：写真だけ */}
               {done.length > 0 && (
                 <>
                   <p className="text-sm text-stone-500 mb-4 mt-10">編みあがったもの</p>
@@ -302,7 +323,7 @@
             onClick={onYarns}
             className="mt-6 text-sm text-stone-500 border border-stone-200 rounded-full px-5 py-2 bg-white active:scale-95 transition-transform"
           >
-            🧶 毛糸ストック
+            🧶 毛糸をさがす
           </button>
         </div>
       );
@@ -310,7 +331,7 @@
 
     const ROW_SAVE_DEBOUNCE_MS = 3000;
 
-    function WorkView({ work, onBack, onChange }) {
+    function WorkView({ work, onBack, onChange, onOpenYarn }) {
       const [logs, setLogs] = useState([]);
       const [logsLoaded, setLogsLoaded] = useState(false);
       const [currentRow, setCurrentRow] = useState(work.current_row);
@@ -324,6 +345,14 @@
       const [bellOpen, setBellOpen] = useState(false);
       const [swing, setSwing] = useState(false);
       const [error, setError] = useState(null);
+
+      // 使った毛糸
+      const [workYarns, setWorkYarns] = useState([]);
+      const [workYarnsLoaded, setWorkYarnsLoaded] = useState(false);
+      const [showYarnPicker, setShowYarnPicker] = useState(false);
+      const [allYarns, setAllYarns] = useState([]);
+      const [yarnSearch, setYarnSearch] = useState('');
+
       const fileRef = useRef(null);
       const debounceTimerRef = useRef(null);
       const currentRowRef = useRef(currentRow);
@@ -347,6 +376,10 @@
       }, [work.id]);
 
       useEffect(() => {
+        loadWorkYarns();
+      }, [work.id]);
+
+      useEffect(() => {
         const t = setTimeout(() => {
           setSwing(true);
           setTimeout(() => setSwing(false), 700);
@@ -359,6 +392,63 @@
           if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
         };
       }, []);
+
+      async function loadWorkYarns() {
+        const { data: wyData, error: wyError } = await window.supabaseClient
+          .from('work_yarns')
+          .select('id, yarn_id, usage_note')
+          .eq('work_id', work.id);
+        if (wyError || !wyData || wyData.length === 0) {
+          setWorkYarns([]);
+          setWorkYarnsLoaded(true);
+          return;
+        }
+        const yarnIds = wyData.map(wy => wy.yarn_id);
+        const { data: yarnsData } = await window.supabaseClient
+          .from('yarns')
+          .select('id, name, brand, color, weight, fiber')
+          .in('id', yarnIds);
+        const yarnsMap = {};
+        (yarnsData || []).forEach(y => { yarnsMap[y.id] = y; });
+        setWorkYarns(wyData.map(wy => ({ ...wy, yarn: yarnsMap[wy.yarn_id] || null })));
+        setWorkYarnsLoaded(true);
+      }
+
+      async function openYarnPicker() {
+        setShowYarnPicker(true);
+        if (allYarns.length === 0) {
+          const { data } = await window.supabaseClient
+            .from('yarns')
+            .select('id, name, brand, color, weight, fiber')
+            .order('name');
+          setAllYarns(data || []);
+        }
+      }
+
+      async function addYarnToWork(yarn) {
+        const alreadyAdded = workYarns.some(wy => wy.yarn_id === yarn.id);
+        if (alreadyAdded) return;
+        const { data, error } = await window.supabaseClient
+          .from('work_yarns')
+          .insert([{ work_id: work.id, yarn_id: yarn.id }])
+          .select('id, yarn_id, usage_note')
+          .single();
+        if (!error && data) {
+          setWorkYarns(prev => [...prev, { ...data, yarn }]);
+        }
+        setShowYarnPicker(false);
+        setYarnSearch('');
+      }
+
+      async function removeYarnFromWork(workYarnId) {
+        await window.supabaseClient.from('work_yarns').delete().eq('id', workYarnId);
+        setWorkYarns(prev => prev.filter(wy => wy.id !== workYarnId));
+      }
+
+      const filteredYarns = allYarns.filter(y => {
+        const q = yarnSearch.toLowerCase();
+        return !q || (y.name || '').toLowerCase().includes(q) || (y.brand || '').toLowerCase().includes(q);
+      });
 
       function scheduleFlush() {
         if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
@@ -728,6 +818,89 @@
             </div>
           </div>
 
+          {/* 使った毛糸 */}
+          <div className="mt-10 pt-6 border-t border-stone-100">
+            <p className="text-xs text-stone-400 mb-3">使った毛糸</p>
+            {workYarnsLoaded && (
+              <>
+                {workYarns.length > 0 && (
+                  <ul className="space-y-2 mb-3">
+                    {workYarns.map(wy => (
+                      <li key={wy.id} className="flex items-center justify-between">
+                        <button
+                          onClick={() => wy.yarn && onOpenYarn(wy.yarn.id)}
+                          className="text-sm text-amber-800/70 underline underline-offset-2 text-left"
+                        >
+                          {wy.yarn?.name || '（名前なし）'}
+                          {wy.yarn?.brand && (
+                            <span className="text-xs text-stone-400 ml-1.5 no-underline">{wy.yarn.brand}</span>
+                          )}
+                        </button>
+                        <button
+                          onClick={() => removeYarnFromWork(wy.id)}
+                          className="text-[10px] text-stone-300 ml-3 hover:text-stone-400"
+                        >
+                          はずす
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                {!showYarnPicker ? (
+                  <button
+                    onClick={openYarnPicker}
+                    className="text-xs text-stone-400 border border-stone-200 rounded-full px-4 py-1.5 bg-white active:scale-95 transition-transform"
+                  >
+                    ＋ 毛糸を追加
+                  </button>
+                ) : (
+                  <div className="bg-white border border-stone-200 rounded-xl p-3">
+                    <input
+                      value={yarnSearch}
+                      onChange={e => setYarnSearch(e.target.value)}
+                      placeholder="名前やブランドで検索…"
+                      autoFocus
+                      className="w-full bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none placeholder:text-stone-300 mb-2"
+                    />
+                    {filteredYarns.length === 0 ? (
+                      <p className="text-xs text-stone-300 px-1 py-1">見つかりません</p>
+                    ) : (
+                      <ul className="max-h-40 overflow-y-auto">
+                        {filteredYarns.map(y => {
+                          const added = workYarns.some(wy => wy.yarn_id === y.id);
+                          return (
+                            <li key={y.id}>
+                              <button
+                                onClick={() => !added && addYarnToWork(y)}
+                                disabled={added}
+                                className={`w-full text-left px-2 py-2 rounded-lg text-sm transition-colors ${
+                                  added
+                                    ? 'text-stone-300 cursor-default'
+                                    : 'text-stone-700 hover:bg-stone-50 active:scale-95'
+                                }`}
+                              >
+                                {y.name}
+                                {y.brand && <span className="text-xs text-stone-400 ml-1.5">({y.brand})</span>}
+                                {added && <span className="text-xs text-stone-300 ml-1.5">追加済み</span>}
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                    <button
+                      onClick={() => { setShowYarnPicker(false); setYarnSearch(''); }}
+                      className="mt-2 text-xs text-stone-400 w-full text-center py-1"
+                    >
+                      とじる
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
           {error && <p className="text-xs text-red-400 text-center mt-4">{error}</p>}
 
           {/* 完成（そっと） */}
@@ -791,14 +964,15 @@
       );
     }
 
-    const CURRENT_USER_ID = 1; // 暫定固定値。ログイン機能が入ったら差し替える。
-
-    function YarnsPage({ onBack }) {
+    // -----------------------------------------------------------------------
+    // YarnsPage — 共有毛糸辞典。weight / fiber を追加。毛糸名クリックで詳細へ。
+    // -----------------------------------------------------------------------
+    function YarnsPage({ onBack, onYarnDetail }) {
       const [yarns, setYarns] = useState([]);
       const [stocks, setStocks] = useState([]);
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState(null);
-      const [form, setForm] = useState({ name: '', brand: '', color: '', memo: '' });
+      const [form, setForm] = useState({ name: '', brand: '', color: '', weight: '', fiber: '', memo: '' });
       const [saving, setSaving] = useState(false);
       const [saved, setSaved] = useState(false);
       const [stockForms, setStockForms] = useState({});
@@ -810,7 +984,7 @@
         setLoading(true);
         setError(null);
         const [{ data: yarnsData, error: yarnsError }, { data: stocksData, error: stocksError }] = await Promise.all([
-          window.supabaseClient.from('yarns').select('*'),
+          window.supabaseClient.from('yarns').select('*').order('name'),
           window.supabaseClient.from('yarn_stocks').select('*').eq('user_id', CURRENT_USER_ID),
         ]);
         if (yarnsError) {
@@ -833,13 +1007,15 @@
           name: form.name.trim(),
           brand: form.brand.trim() || null,
           color: form.color.trim() || null,
+          weight: form.weight.trim() || null,
+          fiber: form.fiber.trim() || null,
           memo: form.memo.trim() || null,
         }]);
         setSaving(false);
         if (error) {
           setError(error.message);
         } else {
-          setForm({ name: '', brand: '', color: '', memo: '' });
+          setForm({ name: '', brand: '', color: '', weight: '', fiber: '', memo: '' });
           setSaved(true);
           setTimeout(() => setSaved(false), 1400);
           loadYarns();
@@ -878,7 +1054,7 @@
         <div className="max-w-md mx-auto px-6 pt-12 pb-24">
           <button onClick={onBack} className="text-sm text-stone-400 mb-6">← もどる</button>
           <p className="text-xs tracking-widest text-stone-400 mb-1">AMIMONO</p>
-          <h1 className="text-xl text-stone-700 mb-8">毛糸ストック</h1>
+          <h1 className="text-xl text-stone-700 mb-8">毛糸をさがす</h1>
 
           <form onSubmit={handleSubmit} className="bg-white border border-stone-200 rounded-2xl p-5 mb-8 space-y-3">
             <p className="text-xs text-stone-400 mb-2">あたらしく登録する</p>
@@ -895,10 +1071,24 @@
               placeholder="ブランド"
               className="w-full bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 text-sm text-stone-700 outline-none placeholder:text-stone-300"
             />
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                value={form.color}
+                onChange={e => setForm({ ...form, color: e.target.value })}
+                placeholder="色"
+                className="w-full bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 text-sm text-stone-700 outline-none placeholder:text-stone-300"
+              />
+              <input
+                value={form.weight}
+                onChange={e => setForm({ ...form, weight: e.target.value })}
+                placeholder="太さ（並太 など）"
+                className="w-full bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 text-sm text-stone-700 outline-none placeholder:text-stone-300"
+              />
+            </div>
             <input
-              value={form.color}
-              onChange={e => setForm({ ...form, color: e.target.value })}
-              placeholder="色"
+              value={form.fiber}
+              onChange={e => setForm({ ...form, fiber: e.target.value })}
+              placeholder="素材（ウール・アクリル など）"
               className="w-full bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 text-sm text-stone-700 outline-none placeholder:text-stone-300"
             />
             <textarea
@@ -932,10 +1122,17 @@
                 const stockForm = getStockForm(yarn.id);
                 return (
                   <li key={yarn.id} className="bg-white border border-stone-200 rounded-xl px-4 py-4">
-                    <div className="text-stone-700 text-sm">{yarn.name}</div>
+                    <button
+                      onClick={() => onYarnDetail(yarn.id)}
+                      className="text-stone-700 text-sm font-medium text-left hover:text-amber-800/70 transition-colors"
+                    >
+                      {yarn.name}
+                    </button>
                     <div className="flex flex-wrap gap-x-2 mt-0.5">
                       {yarn.brand && <span className="text-xs text-stone-400">{yarn.brand}</span>}
                       {yarn.color && <span className="text-xs text-stone-400">· {yarn.color}</span>}
+                      {yarn.weight && <span className="text-xs text-stone-400">· {yarn.weight}</span>}
+                      {yarn.fiber && <span className="text-xs text-stone-400">· {yarn.fiber}</span>}
                     </div>
                     {yarn.memo && <p className="text-xs text-stone-500 mt-1">{yarn.memo}</p>}
 
@@ -990,6 +1187,135 @@
           >
             保存しました
           </div>
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // YarnDetailPage — 毛糸の詳細と、この毛糸を使った作品一覧。
+    // 作品をクリックすると WorkView へ、戻るボタンで直前の画面に戻る。
+    // -----------------------------------------------------------------------
+    function YarnDetailPage({ yarnId, onBack, onOpenWork }) {
+      const [yarn, setYarn] = useState(null);
+      const [works, setWorks] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState(null);
+
+      useEffect(() => { load(); }, [yarnId]);
+
+      async function load() {
+        setLoading(true);
+        setError(null);
+
+        const [{ data: yarnData, error: yarnError }, { data: wyData, error: wyError }] = await Promise.all([
+          window.supabaseClient.from('yarns').select('*').eq('id', yarnId).single(),
+          window.supabaseClient.from('work_yarns').select('work_id').eq('yarn_id', yarnId),
+        ]);
+
+        if (yarnError) { setError(yarnError.message); setLoading(false); return; }
+        if (wyError) { setError(wyError.message); setLoading(false); return; }
+        setYarn(yarnData);
+
+        const workIds = (wyData || []).map(wy => wy.work_id);
+        if (workIds.length === 0) {
+          setWorks([]);
+          setLoading(false);
+          return;
+        }
+
+        const { data: worksData, error: worksError } = await window.supabaseClient
+          .from('works')
+          .select('id, title, status, cover_log_id')
+          .in('id', workIds);
+        if (worksError) { setError(worksError.message); setLoading(false); return; }
+
+        const coverLogIds = (worksData || []).map(w => w.cover_log_id).filter(id => id != null);
+        let coverMap = {};
+        if (coverLogIds.length > 0) {
+          const { data: coverLogs } = await window.supabaseClient
+            .from('work_logs')
+            .select('id, photo_url')
+            .in('id', coverLogIds);
+          (coverLogs || []).forEach(l => { coverMap[l.id] = l.photo_url; });
+        }
+
+        setWorks((worksData || []).map(w => ({
+          ...w,
+          coverUrl: w.cover_log_id ? coverMap[w.cover_log_id] || null : null,
+        })));
+        setLoading(false);
+      }
+
+      if (loading) {
+        return (
+          <div style={{ ...serif, background: paper }} className="min-h-screen flex items-center justify-center">
+            <p className="text-stone-400 text-sm">よみこんでいます…</p>
+          </div>
+        );
+      }
+
+      return (
+        <div className="max-w-md mx-auto px-6 pt-6 pb-24">
+          <button onClick={onBack} className="text-sm text-stone-400 mb-6">← もどる</button>
+
+          {yarn && (
+            <>
+              <p className="text-xs tracking-widest text-stone-400 mb-1">YARN</p>
+              <h1 className="text-xl text-stone-700 mb-2">{yarn.name}</h1>
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-stone-400 mb-3">
+                {yarn.brand && <span>{yarn.brand}</span>}
+                {yarn.color && <span>· {yarn.color}</span>}
+                {yarn.weight && <span>· {yarn.weight}</span>}
+                {yarn.fiber && <span>· {yarn.fiber}</span>}
+              </div>
+              {yarn.memo && (
+                <p className="text-sm text-stone-500 mb-6 leading-relaxed">{yarn.memo}</p>
+              )}
+            </>
+          )}
+
+          <div className="mt-6 pt-6 border-t border-stone-100">
+            <p className="text-xs text-stone-400 mb-4">
+              この毛糸を使った作品
+              {works.length > 0 && <span className="ml-1">· {works.length}点</span>}
+            </p>
+
+            {works.length === 0 ? (
+              <p className="text-xs text-stone-300 leading-relaxed">
+                まだありません。
+                <br />
+                作品に毛糸を紐づけると、ここに現れます。
+              </p>
+            ) : (
+              <div className="grid grid-cols-2 gap-3">
+                {works.map(w => (
+                  <button
+                    key={w.id}
+                    onClick={() => onOpenWork(w.id)}
+                    className="aspect-square rounded-xl overflow-hidden border border-stone-200 bg-white active:scale-95 transition-transform"
+                  >
+                    {w.coverUrl ? (
+                      <img src={w.coverUrl} alt="" className="w-full h-full object-cover" />
+                    ) : (
+                      <div
+                        className="w-full h-full flex flex-col items-center justify-center text-center px-3"
+                        style={{ background: "#efeae0" }}
+                      >
+                        <span className="text-stone-500 text-xs leading-relaxed">
+                          {w.title || '名前未設定'}
+                        </span>
+                        {w.status === 'completed' && (
+                          <span className="text-[10px] text-amber-700/60 mt-1">完成</span>
+                        )}
+                      </div>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {error && <p className="text-xs text-red-400 mt-4">{error}</p>}
         </div>
       );
     }
