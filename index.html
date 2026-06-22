@@ -120,6 +120,8 @@
       const [works, setWorks] = useState([]);
       const [loaded, setLoaded] = useState(false);
       const [openId, setOpenId] = useState(null);
+      const [openView, setOpenView] = useState(null); // 'workPage' | 'workView'
+      const [fromWorkPage, setFromWorkPage] = useState(false);
       const [openYarnId, setOpenYarnId] = useState(null);
       const [page, setPage] = useState('home');
       const [error, setError] = useState(null);
@@ -166,10 +168,19 @@
         }
         setWorks((prev) => [{ ...data, coverUrl: null }, ...prev]);
         setOpenId(data.id);
+        setOpenView('workView');
+        setFromWorkPage(false);
       }
 
       function patchWork(id, patch) {
         setWorks((prev) => prev.map((w) => (w.id === id ? { ...w, ...patch } : w)));
+      }
+
+      function handleOpenWork(id) {
+        const target = works.find((w) => w.id === id);
+        setOpenId(id);
+        setOpenView(target?.status === 'completed' ? 'workPage' : 'workView');
+        setFromWorkPage(false);
       }
 
       if (!loaded) {
@@ -186,12 +197,22 @@
             <YarnDetailPage
               yarnId={openYarnId}
               onBack={() => setOpenYarnId(null)}
-              onOpenWork={(workId) => { setOpenYarnId(null); setOpenId(workId); }}
+              onOpenWork={(workId) => { setOpenYarnId(null); handleOpenWork(workId); }}
             />
-          ) : open ? (
+          ) : open && openView === 'workPage' ? (
+            <WorkPage
+              work={open}
+              onBack={() => { setOpenId(null); setOpenView(null); }}
+              onOpenYarn={(yarnId) => setOpenYarnId(yarnId)}
+              onOpenLog={() => { setOpenView('workView'); setFromWorkPage(true); }}
+            />
+          ) : open && openView === 'workView' ? (
             <WorkView
               work={open}
-              onBack={() => setOpenId(null)}
+              onBack={fromWorkPage
+                ? () => { setOpenView('workPage'); setFromWorkPage(false); }
+                : () => { setOpenId(null); setOpenView(null); }
+              }
               onChange={patchWork}
               onOpenYarn={(yarnId) => setOpenYarnId(yarnId)}
             />
@@ -201,7 +222,7 @@
               onYarnDetail={(yarnId) => setOpenYarnId(yarnId)}
             />
           ) : (
-            <Home works={works} onStart={startCounting} onOpen={setOpenId} onYarns={() => setPage('yarns')} />
+            <Home works={works} onStart={startCounting} onOpen={handleOpenWork} onYarns={() => setPage('yarns')} />
           )}
           {error && (
             <div className="fixed bottom-3 left-1/2 -translate-x-1/2 text-xs text-red-400">{error}</div>
@@ -325,6 +346,117 @@
           >
             🧶 毛糸をさがす
           </button>
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // WorkPage — 作品紹介ページ（表）。完成作品だけが持つ。
+    // 写真を主役に、名前・使った毛糸・編みログへの静かな導線を置く。
+    // 将来ここに「他の人の気配」が灯る。
+    // -----------------------------------------------------------------------
+    function WorkPage({ work, onBack, onOpenYarn, onOpenLog }) {
+      const [workYarns, setWorkYarns] = useState([]);
+      const [workYarnsLoaded, setWorkYarnsLoaded] = useState(false);
+
+      useEffect(() => {
+        (async () => {
+          const { data: wyData, error: wyError } = await window.supabaseClient
+            .from('work_yarns')
+            .select('id, yarn_id')
+            .eq('work_id', work.id);
+          if (wyError || !wyData || wyData.length === 0) {
+            setWorkYarns([]);
+            setWorkYarnsLoaded(true);
+            return;
+          }
+          const yarnIds = wyData.map(wy => wy.yarn_id);
+          const { data: yarnsData } = await window.supabaseClient
+            .from('yarns')
+            .select('id, name, brand')
+            .in('id', yarnIds);
+          const yarnsMap = {};
+          (yarnsData || []).forEach(y => { yarnsMap[y.id] = y; });
+          setWorkYarns(wyData.map(wy => ({ ...wy, yarn: yarnsMap[wy.yarn_id] || null })));
+          setWorkYarnsLoaded(true);
+        })();
+      }, [work.id]);
+
+      const cover = work.coverUrl;
+
+      return (
+        <div className="max-w-md mx-auto px-6 pt-6 pb-32">
+          <button onClick={onBack} className="text-sm text-stone-400 mb-8">
+            ← もどる
+          </button>
+
+          {/* 表紙写真 — 主役 */}
+          {cover ? (
+            <div className="mb-7">
+              <img
+                src={cover}
+                alt=""
+                className="w-full rounded-2xl object-cover border border-stone-200"
+                style={{ maxHeight: '72vw' }}
+              />
+            </div>
+          ) : (
+            <div
+              className="w-full rounded-2xl border border-stone-200 flex flex-col items-center justify-center text-center px-6 py-16 mb-7"
+              style={{ background: "#efeae0" }}
+            >
+              <span className="text-stone-500 text-sm">
+                {work.title || `${work.current_row}段`}
+              </span>
+              <span className="text-xs text-stone-400 underline mt-3">写真をそえる</span>
+            </div>
+          )}
+
+          {/* 作品名 */}
+          <div className="mb-7">
+            {work.title ? (
+              <h1 style={serif} className="text-xl text-stone-700">{work.title}</h1>
+            ) : (
+              <div className="flex items-baseline gap-2">
+                <span style={serif} className="text-lg text-stone-500">{work.current_row}段</span>
+                <span className="text-xs text-stone-400 underline">→ 名前をつける</span>
+              </div>
+            )}
+          </div>
+
+          {/* 使った毛糸 */}
+          {workYarnsLoaded && workYarns.length > 0 && (
+            <div className="mb-8 pt-5 border-t border-stone-100">
+              <p className="text-xs text-stone-400 mb-3">使った毛糸</p>
+              <ul className="space-y-2">
+                {workYarns.map(wy => (
+                  <li key={wy.id}>
+                    <button
+                      onClick={() => wy.yarn && onOpenYarn(wy.yarn.id)}
+                      className="text-sm text-amber-800/70 underline underline-offset-2 text-left"
+                    >
+                      {wy.yarn?.name || '（名前なし）'}
+                      {wy.yarn?.brand && (
+                        <span className="text-xs text-stone-400 ml-1.5 no-underline">{wy.yarn.brand}</span>
+                      )}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* 将来ここに"他の人の気配"が灯る */}
+
+          {/* 編みログへの静かな導線 */}
+          <div className="pt-5 border-t border-stone-100">
+            <button
+              onClick={onOpenLog}
+              className="text-xs text-stone-400"
+            >
+              制作の記録へ →
+            </button>
+          </div>
         </div>
       );
     }
