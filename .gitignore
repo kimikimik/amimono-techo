@@ -1,0 +1,9 @@
+# 環境変数（絶対にGitに含めない）
+.env
+.env.local
+.env.*.local
+
+# OS・エディタ系
+.DS_Store
+Thumbs.db
+*.swp
