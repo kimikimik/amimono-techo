@@ -1137,6 +1137,11 @@
       const [labelSaving, setLabelSaving] = useState(false);
       const [labelError, setLabelError] = useState(null);
       const labelFileRef = useRef(null);
+      const [facePhotos, setFacePhotos] = useState([]);
+      const [coverIdx, setCoverIdx] = useState(0);
+      const faceFileRef = useRef(null);
+      const [labellessPending, setLabellessPending] = useState([]);
+      const [labellessCoverIdx, setLabellessCoverIdx] = useState(0);
 
       useEffect(() => { loadYarns(); }, []);
 
@@ -1147,14 +1152,24 @@
           window.supabaseClient.from('yarns').select('*').order('name'),
           window.supabaseClient.from('yarn_stocks').select('*').eq('user_id', CURRENT_USER_ID),
         ]);
-        if (yarnsError) {
-          setError(yarnsError.message);
-        } else if (stocksError) {
-          setError(stocksError.message);
-        } else {
-          setYarns(yarnsData || []);
-          setStocks(stocksData || []);
+        if (yarnsError) { setError(yarnsError.message); setLoading(false); return; }
+        if (stocksError) { setError(stocksError.message); setLoading(false); return; }
+
+        // yarn_photos から顔の代表写真を取得（ラベルは除外）
+        const yarnIds = (yarnsData || []).map(y => y.id);
+        let coverMap = {};
+        if (yarnIds.length > 0) {
+          const { data: coverData } = await window.supabaseClient
+            .from('yarn_photos')
+            .select('yarn_id, url')
+            .in('yarn_id', yarnIds)
+            .eq('role', 'face')
+            .eq('is_cover', true);
+          (coverData || []).forEach(p => { coverMap[p.yarn_id] = p.url; });
         }
+
+        setYarns((yarnsData || []).map(y => ({ ...y, coverPhoto: coverMap[y.id] || null })));
+        setStocks(stocksData || []);
         setLoading(false);
       }
 
@@ -1214,16 +1229,47 @@
         const file = e.target.files?.[0];
         if (!file) return;
         e.target.value = '';
-        setLabellessSaving(true);
         setError(null);
         try {
           const blob = await compressImage(file, COVER_PHOTO_TARGET_KB);
-          const url = await uploadYarnPhoto(blob);
-          const { error: insertErr } = await window.supabaseClient
-            .from('yarns')
-            .insert([{ photo_url: url }]);
-          if (insertErr) throw insertErr;
+          const previewUrl = URL.createObjectURL(blob);
+          setLabellessPending(prev => [...prev, { blob, previewUrl }]);
+        } catch (err) {
+          setError(err.message);
+        }
+      }
+
+      async function handleLabellessSubmit() {
+        if (labellessPending.length === 0) return;
+        setLabellessSaving(true);
+        setError(null);
+        try {
+          // 顔写真をすべてアップロード
+          const faceUrls = [];
+          for (const fp of labellessPending) faceUrls.push(await uploadYarnPhoto(fp.blob));
+          const coverUrl = faceUrls[labellessCoverIdx] ?? faceUrls[0] ?? null;
+
+          // yarns に INSERT
+          const { error: yarnErr } = await window.supabaseClient.from('yarns').insert([{
+            photo_url: coverUrl,
+          }]);
+          if (yarnErr) throw yarnErr;
+
+          // yarn_id を取得
+          const { data: latest } = await window.supabaseClient
+            .from('yarns').select('id').order('created_at', { ascending: false }).limit(1).single();
+          const yarnId = latest.id;
+
+          // yarn_photos に INSERT
+          for (let i = 0; i < faceUrls.length; i++) {
+            await window.supabaseClient.from('yarn_photos').insert([{
+              yarn_id: yarnId, url: faceUrls[i], role: 'face',
+              is_cover: i === labellessCoverIdx, sort_order: i,
+            }]);
+          }
+
           setShowLabelless(false);
+          setLabellessPending([]); setLabellessCoverIdx(0);
           loadYarns();
         } catch (err) {
           setError(err.message);
@@ -1268,25 +1314,61 @@
         }
       }
 
+      async function handleAddFacePhoto(e) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        e.target.value = '';
+        try {
+          const blob = await compressImage(file, COVER_PHOTO_TARGET_KB);
+          const previewUrl = URL.createObjectURL(blob);
+          setFacePhotos(prev => [...prev, { blob, previewUrl }]);
+        } catch (err) {
+          setLabelError(err.message || '追加できませんでした');
+        }
+      }
+
       async function handleLabelSubmit(e) {
         e.preventDefault();
-        if (!labelBlob) return;
         setLabelSaving(true);
         setLabelError(null);
         try {
-          const url = await uploadYarnPhoto(labelBlob);
-          const { error: insertErr } = await window.supabaseClient.from('yarns').insert([{
+          // 全写真をアップロード
+          let labelUrl = null;
+          if (labelBlob) labelUrl = await uploadYarnPhoto(labelBlob);
+          const faceUrls = [];
+          for (const fp of facePhotos) faceUrls.push(await uploadYarnPhoto(fp.blob));
+          const coverUrl = faceUrls[coverIdx] ?? null;
+
+          // yarns に INSERT（顔の代表URLを photo_url に入れて後方互換を保つ）
+          const { error: yarnErr } = await window.supabaseClient.from('yarns').insert([{
             brand: labelDraft.brand.trim() || null,
             name: labelDraft.name.trim() || null,
             color: labelDraft.color.trim() || null,
-            photo_url: url,
+            photo_url: coverUrl,
           }]);
-          if (insertErr) throw insertErr;
+          if (yarnErr) throw yarnErr;
+
+          // yarn_id を取得
+          const { data: latest } = await window.supabaseClient
+            .from('yarns').select('id').order('created_at', { ascending: false }).limit(1).single();
+          const yarnId = latest.id;
+
+          // ラベル写真を yarn_photos に INSERT
+          if (labelUrl) {
+            await window.supabaseClient.from('yarn_photos').insert([{
+              yarn_id: yarnId, url: labelUrl, role: 'label', is_cover: false, sort_order: 0,
+            }]);
+          }
+          // 顔写真を yarn_photos に INSERT
+          for (let i = 0; i < faceUrls.length; i++) {
+            await window.supabaseClient.from('yarn_photos').insert([{
+              yarn_id: yarnId, url: faceUrls[i], role: 'face', is_cover: i === coverIdx, sort_order: i,
+            }]);
+          }
+
           setShowLabel(false);
-          setLabelBlob(null);
-          setLabelPreviewUrl(null);
-          setLabelDraft(null);
-          setLabelError(null);
+          setLabelBlob(null); setLabelPreviewUrl(null); setLabelDraft(null); setLabelError(null);
+          setFacePhotos([]); setCoverIdx(0);
           loadYarns();
         } catch (err) {
           setLabelError(err.message);
@@ -1346,6 +1428,29 @@
                     placeholder="色番号・色名"
                     className="w-full bg-stone-50 border border-stone-200 rounded-lg px-3 py-2 text-sm text-stone-700 outline-none placeholder:text-stone-300"
                   />
+                  <div className="pt-2 border-t border-stone-100">
+                    <p className="text-xs text-stone-400 mb-2">顔写真（糸そのもの）</p>
+                    <input ref={faceFileRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handleAddFacePhoto} />
+                    {facePhotos.length === 0 ? (
+                      <button type="button" onClick={() => faceFileRef.current?.click()} className="w-full py-3 text-xs text-stone-400 border border-dashed border-stone-200 rounded-lg active:scale-95 transition-transform">
+                        ＋ 顔写真を追加
+                      </button>
+                    ) : (
+                      <div className="space-y-2">
+                        {facePhotos.map((p, i) => (
+                          <div key={i} className="flex items-center gap-2">
+                            <img src={p.previewUrl} alt="" className="w-12 h-12 rounded-lg object-cover border border-stone-200 flex-shrink-0" />
+                            <label className="flex items-center gap-1 text-xs text-stone-500 cursor-pointer flex-1">
+                              <input type="radio" name="p1_cover" checked={coverIdx === i} onChange={() => setCoverIdx(i)} className="accent-stone-400" />
+                              代表
+                            </label>
+                            <button type="button" onClick={() => { setFacePhotos(prev => prev.filter((_, j) => j !== i)); if (coverIdx > 0) setCoverIdx(c => Math.min(c, facePhotos.length - 2)); }} className="text-xs text-stone-300 px-1">✕</button>
+                          </div>
+                        ))}
+                        <button type="button" onClick={() => faceFileRef.current?.click()} className="text-xs text-stone-400 underline">＋ もう1枚</button>
+                      </div>
+                    )}
+                  </div>
                   {labelError && <p className="text-xs text-red-400">{labelError}</p>}
                   <div className="flex justify-between items-center">
                     <button
@@ -1386,6 +1491,25 @@
               />
               {labellessSaving ? (
                 <p className="text-sm text-stone-400 py-4 text-center">登録しています…</p>
+              ) : labellessPending.length > 0 ? (
+                <div className="space-y-2">
+                  {labellessPending.map((p, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <img src={p.previewUrl} alt="" className="w-12 h-12 rounded-lg object-cover border border-stone-200 flex-shrink-0" />
+                      {labellessPending.length > 1 && (
+                        <label className="flex items-center gap-1 text-xs text-stone-500 cursor-pointer flex-1">
+                          <input type="radio" name="p2_cover" checked={labellessCoverIdx === i} onChange={() => setLabellessCoverIdx(i)} className="accent-stone-400" />
+                          代表
+                        </label>
+                      )}
+                      <button type="button" onClick={() => { setLabellessPending(prev => prev.filter((_, j) => j !== i)); if (labellessCoverIdx > 0) setLabellessCoverIdx(c => Math.min(c, labellessPending.length - 2)); }} className="text-xs text-stone-300 px-1">✕</button>
+                    </div>
+                  ))}
+                  <button type="button" onClick={() => labellessFileRef.current?.click()} className="text-xs text-stone-400 underline">＋ もう1枚</button>
+                  <button type="button" onClick={handleLabellessSubmit} className="w-full mt-1 text-sm text-stone-500 border border-stone-200 rounded-full py-2 bg-white active:scale-95 transition-transform">
+                    のこす
+                  </button>
+                </div>
               ) : (
                 <button
                   type="button"
@@ -1398,7 +1522,7 @@
               {error && <p className="text-xs text-red-400 mt-2">{error}</p>}
               <button
                 type="button"
-                onClick={() => { setShowLabelless(false); setError(null); }}
+                onClick={() => { setShowLabelless(false); setError(null); setLabellessPending([]); setLabellessCoverIdx(0); }}
                 className="mt-4 text-xs text-stone-400 underline block"
               >
                 名前を入力して登録する
@@ -1481,11 +1605,11 @@
                 const stockForm = getStockForm(yarn.id);
                 return (
                   <li key={yarn.id} className="bg-white border border-stone-200 rounded-xl overflow-hidden">
-                    {yarn.photo_url && (
+                    {(yarn.coverPhoto || yarn.photo_url) ? (
                       <button onClick={() => onYarnDetail(yarn.id)} className="block w-full">
-                        <img src={yarn.photo_url} alt="" className="w-full object-cover" style={{ maxHeight: '120px' }} />
+                        <img src={yarn.coverPhoto || yarn.photo_url} alt="" className="w-full object-cover" style={{ maxHeight: '120px' }} />
                       </button>
-                    )}
+                    ) : null}
                     <div className="px-4 py-4">
                     <button
                       onClick={() => onYarnDetail(yarn.id)}
@@ -1566,6 +1690,7 @@
       const [works, setWorks] = useState([]);
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState(null);
+      const [yarnPhotos, setYarnPhotos] = useState([]);
 
       useEffect(() => { load(); }, [yarnId]);
 
@@ -1573,14 +1698,20 @@
         setLoading(true);
         setError(null);
 
-        const [{ data: yarnData, error: yarnError }, { data: wyData, error: wyError }] = await Promise.all([
+        const [
+          { data: yarnData, error: yarnError },
+          { data: wyData, error: wyError },
+          { data: photosData },
+        ] = await Promise.all([
           window.supabaseClient.from('yarns').select('*').eq('id', yarnId).single(),
           window.supabaseClient.from('work_yarns').select('work_id').eq('yarn_id', yarnId),
+          window.supabaseClient.from('yarn_photos').select('*').eq('yarn_id', yarnId).order('sort_order'),
         ]);
 
         if (yarnError) { setError(yarnError.message); setLoading(false); return; }
         if (wyError) { setError(wyError.message); setLoading(false); return; }
         setYarn(yarnData);
+        setYarnPhotos(photosData || []);
 
         const workIds = (wyData || []).map(wy => wy.work_id);
         if (workIds.length === 0) {
@@ -1620,6 +1751,9 @@
         );
       }
 
+      const facePhotos = yarnPhotos.filter(p => p.role === 'face');
+      const labelPhotos = yarnPhotos.filter(p => p.role === 'label');
+
       return (
         <div className="max-w-md mx-auto px-6 pt-6 pb-24">
           <div className="flex items-center gap-3 mb-6">
@@ -1630,11 +1764,23 @@
 
           {yarn && (
             <>
-              {yarn.photo_url && (
+              {facePhotos.length > 0 ? (
+                <div className="mb-6">
+                  {facePhotos.length === 1 ? (
+                    <img src={facePhotos[0].url} alt="" className="w-full rounded-2xl object-cover border border-stone-200" style={{ maxHeight: '55vw' }} />
+                  ) : (
+                    <div className="flex gap-2 overflow-x-auto pb-1">
+                      {facePhotos.map((p, i) => (
+                        <img key={i} src={p.url} alt="" className="rounded-xl object-cover border border-stone-200 flex-shrink-0" style={{ height: '50vw', width: '50vw' }} />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : yarn.photo_url ? (
                 <div className="mb-6">
                   <img src={yarn.photo_url} alt="" className="w-full rounded-2xl object-cover border border-stone-200" style={{ maxHeight: '55vw' }} />
                 </div>
-              )}
+              ) : null}
               <p className="text-xs tracking-widest text-stone-400 mb-1">YARN</p>
               <h1 className="text-xl text-stone-700 mb-2">{yarn.name || '（名前なし）'}</h1>
               <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-stone-400 mb-3">
@@ -1644,7 +1790,17 @@
                 {yarn.fiber && <span>· {yarn.fiber}</span>}
               </div>
               {yarn.memo && (
-                <p className="text-sm text-stone-500 mb-6 leading-relaxed">{yarn.memo}</p>
+                <p className="text-sm text-stone-500 mb-4 leading-relaxed">{yarn.memo}</p>
+              )}
+              {labelPhotos.length > 0 && (
+                <div className="mb-6">
+                  <p className="text-xs text-stone-400 mb-2">ラベル</p>
+                  <div className="flex gap-2 overflow-x-auto pb-1">
+                    {labelPhotos.map((p, i) => (
+                      <img key={i} src={p.url} alt="" className="rounded-xl object-cover border border-stone-200 flex-shrink-0" style={{ height: '44vw', width: '44vw' }} />
+                    ))}
+                  </div>
+                </div>
               )}
             </>
           )}
