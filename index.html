@@ -1607,7 +1607,7 @@
                   <li key={yarn.id} className="bg-white border border-stone-200 rounded-xl overflow-hidden">
                     {(yarn.coverPhoto || yarn.photo_url) ? (
                       <button onClick={() => onYarnDetail(yarn.id)} className="block w-full">
-                        <img src={yarn.coverPhoto || yarn.photo_url} alt="" className="w-full object-cover" style={{ maxHeight: '120px' }} />
+                        <img src={yarn.coverPhoto || yarn.photo_url} alt="" className="w-full object-contain" style={{ height: '120px', background: '#efeae0' }} />
                       </button>
                     ) : null}
                     <div className="px-4 py-4">
